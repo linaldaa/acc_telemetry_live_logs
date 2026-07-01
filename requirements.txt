@@ -1,0 +1,6 @@
+# Logger (logger.py) uses only the Python standard library (sqlite3, ctypes,
+# mmap) — no third-party packages required to capture telemetry.
+
+# Post-session dashboard (dashboard.py):
+pandas>=2.0
+streamlit>=1.30
