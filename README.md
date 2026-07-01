@@ -45,10 +45,25 @@ python logger.py                         # reads Local\acpmf_* shared memory at 
 Leave it running in the background while you drive. Stop with `Ctrl-C` — it
 flushes the current state and prints a stint summary.
 
+### Verify the live feed first (`--check`)
+
+The real reader depends on the shared-memory struct layout matching your ACC
+version. Before a full stint, get on track and run:
+
+```bash
+python logger.py --check
+```
+
+It reads one live frame and prints the raw values (speed, gear, fuel, inputs,
+per-wheel temps/slip) without writing anything. Compare them to your in-game
+HUD: if speed/gear/fuel look right and brake/throttle sit in 0–1, the layout is
+correct and you can run for real. Garbage values mean the structs need updating.
+
 ### Logger options
 
 ```
 --sim              use the built-in simulator instead of live shared memory
+--check            read one live frame, print it, and exit (no logging)
 --db PATH          SQLite database path (default: telemetry.db)
 --hz N             polling frequency (default: 20)
 --laps N           stop after N laps (handy for the simulator / testing)
@@ -101,11 +116,33 @@ completion so its events attach to the correct lap.
 **Events** `(event_id PK, lap_id FK, event_type, location, peak_value, duration,
 detail)` — tactical view; `event_type` is `BRAKING` or `FUEL_SAVE`.
 
+**Samples** `(sample_id PK, event_id FK, lap_id FK, t_ms, phase, throttle,
+brake, steer, speed_kmh, gear, rpm, slip_*, tyre_*, btemp_*, norm_pos)` — the
+raw ~20Hz time series captured *around* each event: a pre-roll lead-in
+(`phase='PRE'`), the event itself (`'EVENT'`), and a post-roll (`'POST'`). This
+is the data for causality analysis — brake onset, modulation rate, temperature
+slopes (dT/dt), and slip-vs-brake or steer-vs-brake (trail-braking) correlation.
+The lightweight Events row is the index; the Samples rows are the detail behind
+it. Captured frames are batch-written in one transaction per event so the 20Hz
+loop isn't slowed. Window sizes are `PRE_BUFFER_S` / `POST_BUFFER_S` in
+`logger.py` (default 1.5s each).
+
+Example — pull the full brake trace for one event:
+
+```sql
+SELECT phase, t_ms, brake, steer, speed_kmh, slip_fl, tyre_fl, btemp_fl
+FROM Samples WHERE event_id = ? ORDER BY sample_id;
+```
+
 ## Dashboard personas
 
 **Module A — Tactical View (Driver):** which laps and corners breached thermal
 thresholds (peak brake temp, lockups), so the driver can adjust brake bias or
-inputs next stint.
+inputs next stint. Includes an **Event detail** drill-down: pick any braking or
+fuel-save event and see its raw telemetry traces (brake/throttle/steer, wheel
+slip, speed, tyre/brake temps) plotted on a shared time axis with the event
+window shaded — so you can read causality (e.g. steer winding on while still
+braking → trail-braking → front-left lockup) directly off the chart.
 
 **Module B — Strategic View (Race Engineer):** lap-time trend, fuel burned vs
 remaining (pit-window crossover), and an **Endurance Management Score (EMS)**
@@ -113,14 +150,18 @@ derived from lap-time standard deviation (100 = metronomic consistency).
 
 ## How events are detected (state machine)
 
-The loop never stores raw 20Hz samples. Instead it watches for trigger
-conditions and aggregates peaks while the condition holds:
+The loop watches for trigger conditions and aggregates peaks while the
+condition holds, committing one summarized Events row per occurrence:
 
 - **Braking event** — opens when `brake > 0.05`; tracks peak brake temp, peak
   tyre temp, max wheel slip, and duration. On release it commits one row,
   flagging *severe* braking, *lockups* (slip > 1.2), and *overheating*.
 - **Fuel-save event** — opens when coasting (`gas ≈ 0` and `brake ≈ 0` above
   60 km/h) and commits if the coast lasts longer than 0.3s.
+
+Alongside each event it also keeps the raw ~20Hz frames for that window (plus a
+short lead-in/lead-out) in the Samples table, so nothing is lost for later
+analysis — the summary is for the live feed, the samples are for the engineer.
 
 Thresholds live at the top of `logger.py` and are easy to tune.
 

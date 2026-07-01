@@ -24,6 +24,7 @@ import argparse
 import sqlite3
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from statistics import mean, pstdev
 from typing import List, Optional
@@ -43,6 +44,10 @@ COAST_MIN_S = 0.30         # min duration of a lift-and-coast to count as fuel s
 SLOW_DELTA = 0.20          # lap-time variance band (s) for "on pace" vs flagged
 
 TANK_RESERVE = 2.0         # litres held back when estimating laps remaining
+
+# Raw-sample capture window around each event (in seconds of in-lap time).
+PRE_BUFFER_S = 1.5         # how much lead-in to keep before an event starts
+POST_BUFFER_S = 1.5        # how long to keep recording after an event ends
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +79,28 @@ CREATE TABLE IF NOT EXISTS Events (
     duration    REAL,        -- seconds
     detail      TEXT         -- free-form analysis string
 );
+
+-- Raw per-frame telemetry captured AROUND each event (pre-roll, the event
+-- itself, and a post-roll). This is the time series the engineer can mine for
+-- causality: brake onset, modulation, temperature slopes, slip vs brake, etc.
+CREATE TABLE IF NOT EXISTS Samples (
+    sample_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER REFERENCES Events(event_id),
+    lap_id      INTEGER REFERENCES Laps(lap_id),
+    t_ms        INTEGER,     -- in-lap time of the frame (ms)
+    phase       TEXT,        -- 'PRE' | 'EVENT' | 'POST'
+    throttle    REAL,
+    brake       REAL,
+    steer       REAL,
+    speed_kmh   REAL,
+    gear        INTEGER,
+    rpm         INTEGER,
+    slip_fl REAL, slip_fr REAL, slip_rl REAL, slip_rr REAL,
+    tyre_fl REAL, tyre_fr REAL, tyre_rl REAL, tyre_rr REAL,
+    btemp_fl REAL, btemp_fr REAL, btemp_rl REAL, btemp_rr REAL,
+    norm_pos    REAL         -- normalized lap position 0..1
+);
+CREATE INDEX IF NOT EXISTS idx_samples_event ON Samples(event_id);
 """
 
 
@@ -110,11 +137,29 @@ class Database:
         self.conn.commit()
 
     def insert_event(self, lap_id: Optional[int], event_type: str, location: str,
-                     peak_value: float, duration: float, detail: str) -> None:
-        self.conn.execute(
+                     peak_value: float, duration: float, detail: str) -> int:
+        cur = self.conn.execute(
             "INSERT INTO Events (lap_id, event_type, location, peak_value, duration, detail) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (lap_id, event_type, location, peak_value, duration, detail),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def insert_samples(self, rows: List[tuple]) -> None:
+        """Batch-write raw frames for one event in a single transaction.
+
+        Using executemany + one commit (instead of committing per frame) keeps
+        the 20Hz loop responsive even though an event can be hundreds of rows.
+        """
+        if not rows:
+            return
+        self.conn.executemany(
+            "INSERT INTO Samples (event_id, lap_id, t_ms, phase, throttle, brake, steer, "
+            "speed_kmh, gear, rpm, slip_fl, slip_fr, slip_rl, slip_rr, "
+            "tyre_fl, tyre_fr, tyre_rl, tyre_rr, btemp_fl, btemp_fr, btemp_rl, btemp_rr, norm_pos) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
         )
         self.conn.commit()
 
@@ -220,6 +265,15 @@ class TelemetryLogger:
         self._coast_dur = 0.0
         self._coast_start_pos = 0.0
 
+        # Raw-sample capture state.
+        # _frame_buffer: rolling history of recent frames, used to grab the
+        #   pre-roll once an event starts (sized in run()).
+        # _cap: the in-progress capture while an event is happening.
+        # _post: a finished event still collecting its post-roll frames.
+        self._frame_buffer: deque = deque()
+        self._cap: Optional[dict] = None
+        self._post: Optional[dict] = None
+
         self._last_completed_laps = 0
         self._tick = 0.05  # seconds per loop, updated from real hz
 
@@ -236,6 +290,66 @@ class TelemetryLogger:
             print(f"=== SESSION {self.session_id} START === "
                   f"{f.car_model} @ {f.track}\n")
 
+    # -- raw sample capture ----------------------------------------------
+    @staticmethod
+    def _sample_row(event_id: int, lap_id: Optional[int], phase: str,
+                    f: TelemetryFrame) -> tuple:
+        """Flatten one TelemetryFrame into a Samples row tuple."""
+        return (
+            event_id, lap_id, f.current_time_ms, phase,
+            f.gas, f.brake, f.steer_angle, f.speed_kmh, f.gear, f.rpm,
+            f.wheel_slip[0], f.wheel_slip[1], f.wheel_slip[2], f.wheel_slip[3],
+            f.tyre_temp[0], f.tyre_temp[1], f.tyre_temp[2], f.tyre_temp[3],
+            f.brake_temp[0], f.brake_temp[1], f.brake_temp[2], f.brake_temp[3],
+            f.normalized_car_position,
+        )
+
+    def _begin_capture(self, lap_id: Optional[int], f: TelemetryFrame) -> None:
+        """Open a capture for a just-started event, seeding it with pre-roll."""
+        # If a previous event is still gathering its post-roll, flush it now
+        # (truncated) so captures never overlap.
+        if self._post is not None:
+            self._flush_post()
+        now = f.current_time_ms
+        window = PRE_BUFFER_S * 1000
+        pre = [fr for fr in self._frame_buffer
+               if fr is not f and 0 <= now - fr.current_time_ms <= window]
+        self._cap = {"lap_id": lap_id,
+                     "frames": [("PRE", fr) for fr in pre] + [("EVENT", f)]}
+
+    def _capture_frame(self, f: TelemetryFrame) -> None:
+        """Add a frame to the in-progress event capture (called each frame)."""
+        if self._cap is not None:
+            self._cap["frames"].append(("EVENT", f))
+
+    def _end_capture(self, event_id: int, f: TelemetryFrame) -> None:
+        """Event committed: switch the capture into post-roll collection."""
+        if self._cap is None:
+            return
+        self._post = {"event_id": event_id, "lap_id": self._cap["lap_id"],
+                      "frames": self._cap["frames"], "start_ms": f.current_time_ms}
+        self._cap = None
+
+    def _update_post(self, f: TelemetryFrame) -> None:
+        """Collect post-roll frames until the time window elapses, then flush."""
+        if self._post is None:
+            return
+        elapsed = f.current_time_ms - self._post["start_ms"]
+        self._post["frames"].append(("POST", f))
+        # Negative elapsed => lap rolled over; stop here.
+        if elapsed < 0 or elapsed >= POST_BUFFER_S * 1000:
+            self._flush_post()
+
+    def _flush_post(self) -> None:
+        if self._post is None:
+            return
+        eid = self._post["event_id"]
+        lap_id = self._post["lap_id"]
+        rows = [self._sample_row(eid, lap_id, phase, fr)
+                for phase, fr in self._post["frames"]]
+        self.db.insert_samples(rows)
+        self._post = None
+
     # -- event: braking ---------------------------------------------------
     def _update_braking(self, f: TelemetryFrame) -> None:
         if f.brake > BRAKE_ON:
@@ -248,6 +362,9 @@ class TelemetryLogger:
                 self._brake_hot_tyre = 0
                 self._brake_hot_tyre_temp = 0.0
                 self._brake_start_pos = f.normalized_car_position
+                self._begin_capture(self.current_lap_id, f)
+            else:
+                self._capture_frame(f)
             self._brake_dur += self._tick
             self._brake_peak = max(self._brake_peak, f.brake)
             self._brake_temp_peak = max(self._brake_temp_peak, max(f.brake_temp))
@@ -266,6 +383,7 @@ class TelemetryLogger:
     def _commit_braking(self, f: TelemetryFrame) -> None:
         self._braking = False
         if self._brake_dur < 0.10:  # ignore brushing the pedal
+            self._cap = None        # discard the throwaway capture
             return
         severe = self._brake_peak >= SEVERE_BRAKE
         ev = {
@@ -279,10 +397,11 @@ class TelemetryLogger:
         detail = (f"peak_brake={self._brake_peak:.2f} "
                   f"lockup={self._brake_lockup} "
                   f"hot_tyre={TYRE_LABELS[self._brake_hot_tyre]}")
-        self.db.insert_event(
+        event_id = self.db.insert_event(
             self.current_lap_id, "BRAKING", ev["location"],
             self._brake_temp_peak, self._brake_dur, detail,
         )
+        self._end_capture(event_id, f)
         self.eng.on_braking_event(self.lap_number, f.current_time_str, ev)
 
     # -- event: fuel save / coast ----------------------------------------
@@ -293,6 +412,9 @@ class TelemetryLogger:
                 self._coasting = True
                 self._coast_dur = 0.0
                 self._coast_start_pos = f.normalized_car_position
+                self._begin_capture(self.current_lap_id, f)
+            else:
+                self._capture_frame(f)
             self._coast_dur += self._tick
         elif self._coasting:
             self._commit_coasting(f)
@@ -300,13 +422,15 @@ class TelemetryLogger:
     def _commit_coasting(self, f: TelemetryFrame) -> None:
         self._coasting = False
         if self._coast_dur < COAST_MIN_S:
+            self._cap = None        # discard the throwaway capture
             return
         loc = sector_label(f.current_sector)
         detail = f"coast_gap_ms={self._coast_dur * 1000:.0f}"
-        self.db.insert_event(
+        event_id = self.db.insert_event(
             self.current_lap_id, "FUEL_SAVE", loc,
             self._coast_dur * 1000.0, self._coast_dur, detail,
         )
+        self._end_capture(event_id, f)
         self.eng.on_fuel_save(self.lap_number, f.current_time_str,
                               {"location": loc, "duration": self._coast_dur})
 
@@ -351,6 +475,9 @@ class TelemetryLogger:
         period = 1.0 / hz           # how long to sleep between polls
         last_packet = -1            # used to ignore frames we've already seen
         prev_time_ms: Optional[int] = None
+        # Rolling history for event pre-roll. Sized to comfortably cover
+        # PRE_BUFFER_S of frames; the exact window is enforced by timestamp.
+        self._frame_buffer = deque(maxlen=max(20, int(PRE_BUFFER_S * hz) + 10))
         try:
             while True:
                 f = self.source.read()
@@ -374,9 +501,15 @@ class TelemetryLogger:
                     self._tick = delta if 0.0 < delta < 1.0 else (1.0 / hz)
                 prev_time_ms = f.current_time_ms
 
+                # Record the frame for pre-roll BEFORE the detectors run, so a
+                # freshly-triggered event can look back at its lead-in.
+                self._frame_buffer.append(f)
+
                 self.ensure_session(f)
                 self._update_braking(f)
                 self._update_coasting(f)
+                # Collect post-roll frames for a just-finished event.
+                self._update_post(f)
                 self._check_lap_complete(f)
 
                 if max_laps is not None and self.lap_number >= max_laps:
@@ -387,6 +520,15 @@ class TelemetryLogger:
         except KeyboardInterrupt:
             print("\n=== Stopped by user. ===")
         finally:
+            # Flush any capture still in progress so no event loses its samples.
+            if self._post is not None:
+                self._flush_post()
+            elif self._cap is not None:
+                # Event never committed (e.g. stopped mid-brake): keep its
+                # frames anyway, tagged to no event.
+                rows = [self._sample_row(None, self._cap["lap_id"], phase, fr)
+                        for phase, fr in self._cap["frames"]]
+                self.db.insert_samples(rows)
             self.report_summary()
             self.source.close()
             self.db.close()
@@ -433,9 +575,59 @@ def build_source(args):
         sys.exit(1)
 
 
+def run_check(source, hz: float = 20.0, timeout_s: float = 10.0) -> None:
+    """Read one LIVE frame and print its raw values for verification.
+
+    Use this before a real stint to confirm the shared-memory struct layout
+    lines up with your ACC version: compare these numbers to your in-game HUD.
+    If speed/gear/fuel look sane and brake/throttle sit in 0..1, the layout is
+    correct. Garbage or wildly wrong values mean the structs need updating.
+    """
+    def wheels(label: str, arr, unit: str = "") -> str:
+        cells = "  ".join(f"{TYRE_LABELS[i]}={arr[i]:.2f}{unit}" for i in range(4))
+        return f"   {label:<16} {cells}"
+
+    print(f"Waiting for a LIVE frame (up to {timeout_s:.0f}s)...")
+    deadline = time.time() + timeout_s
+    frame = None
+    while time.time() < deadline:
+        fr = source.read()
+        if fr.is_live:
+            frame = fr
+            break
+        time.sleep(1.0 / hz)
+
+    if frame is None:
+        print("No LIVE frame received. Is ACC running and out ON TRACK "
+              "(not in menus or replay)?")
+        source.close()
+        return
+
+    f = frame
+    print("\n=== LIVE FRAME — compare these to your in-game HUD ===")
+    print(f"   Session     : track={f.track!r}  car={f.car_model!r}")
+    print(f"   Status      : {'LIVE' if f.is_live else f.status}  (packet {f.packet_id})")
+    print(f"   Lap state   : completed_laps={f.completed_laps}  "
+          f"sector={f.current_sector + 1}  in_pit={f.in_pit}")
+    print(f"   Lap clock   : current={f.current_time_str}  "
+          f"last_ms={f.last_time_ms}  pos={f.normalized_car_position:.3f}")
+    print(f"   Inputs      : throttle={f.gas:.2f}  brake={f.brake:.2f}  "
+          f"steer={f.steer_angle:.2f}")
+    print(f"   Drivetrain  : speed={f.speed_kmh:.1f} km/h  gear={f.gear}  rpm={f.rpm}")
+    print(f"   Fuel        : {f.fuel:.2f} L  (tank max {f.max_fuel:.0f} L)")
+    print(wheels("wheel slip", f.wheel_slip))
+    print(wheels("tyre temp °C", f.tyre_temp))
+    print(wheels("brake temp °C", f.brake_temp))
+    print("\nIf these look right, run without --check to start logging. "
+          "If they're garbage, the shared-memory structs need updating.\n")
+    source.close()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="ACC Telemetry & Virtual Race Engineer logger")
     p.add_argument("--sim", action="store_true", help="use the built-in simulator")
+    p.add_argument("--check", action="store_true",
+                   help="read one live frame, print its raw values, and exit (no logging)")
     p.add_argument("--db", default="telemetry.db", help="SQLite database path")
     p.add_argument("--hz", type=float, default=20.0, help="polling frequency (default 20Hz)")
     p.add_argument("--laps", type=int, default=None, help="stop after N laps (simulator/testing)")
@@ -445,6 +637,12 @@ def main() -> None:
     args = p.parse_args()
 
     source = build_source(args)
+
+    # Verification mode: dump one frame and exit without touching the database.
+    if args.check:
+        run_check(source, hz=args.hz)
+        return
+
     db = Database(args.db)
     logger = TelemetryLogger(source, db, RaceEngineer())
     logger.run(hz=args.hz, max_laps=args.laps)

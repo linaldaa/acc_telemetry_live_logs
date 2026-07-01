@@ -19,6 +19,7 @@ import argparse
 import sqlite3
 import sys
 
+import altair as alt          # bundled with Streamlit; no extra dependency
 import pandas as pd
 import streamlit as st
 
@@ -50,12 +51,127 @@ def load(db_path: str):
     return sessions, laps, events
 
 
+@st.cache_data(ttl=10)
+def load_samples(db_path: str, event_id: int) -> pd.DataFrame:
+    """Load the raw frames for ONE event (small), or an empty frame.
+
+    Only pulls the selected event's rows rather than the whole Samples table,
+    and returns empty if the table doesn't exist (older databases).
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql_query(
+            "SELECT * FROM Samples WHERE event_id = ? ORDER BY sample_id",
+            conn, params=(event_id,),
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
 def fmt_laptime(seconds: float) -> str:
     if pd.isna(seconds) or seconds <= 0:
         return "--:--.---"
     m = int(seconds // 60)
     s = seconds - m * 60
     return f"{m}:{s:06.3f}"
+
+
+# ---------------------------------------------------------------------------
+# Event-detail raw-trace rendering (Altair)
+# ---------------------------------------------------------------------------
+def _trace_panel(df: pd.DataFrame, channels: dict, y_title: str, title: str,
+                 event_span: tuple) -> alt.LayerChart:
+    """One stacked panel: several channels vs time, with the EVENT window shaded.
+
+    `df` is the wide samples frame (one row per frame). `channels` maps a column
+    name -> the legend label to show for it. We reshape to long/tidy form so
+    Altair can colour one line per channel from a single encoding.
+    """
+    long = df.melt(
+        id_vars=["t_rel"], value_vars=list(channels.keys()),
+        var_name="channel", value_name="value",
+    )
+    long["channel"] = long["channel"].map(channels)
+
+    # Light band marking the actual event (between pre-roll and post-roll).
+    band = (
+        alt.Chart(pd.DataFrame({"start": [event_span[0]], "end": [event_span[1]]}))
+        .mark_rect(opacity=0.10, color="#5B8DEF")
+        .encode(x="start:Q", x2="end:Q")
+    )
+    # Vertical rule at t=0 (the instant the event began).
+    onset = (
+        alt.Chart(pd.DataFrame({"x": [0.0]}))
+        .mark_rule(strokeDash=[4, 4], color="#888")
+        .encode(x="x:Q")
+    )
+    lines = (
+        alt.Chart(long)
+        .mark_line()
+        .encode(
+            x=alt.X("t_rel:Q", title="Time (s) — 0 = event start"),
+            y=alt.Y("value:Q", title=y_title),
+            color=alt.Color("channel:N", title=None),
+            tooltip=["channel:N", alt.Tooltip("t_rel:Q", format=".2f"),
+                     alt.Tooltip("value:Q", format=".2f")],
+        )
+    )
+    return (band + onset + lines).properties(height=170, title=title)
+
+
+def render_event_detail(db_path: str, ev_row: pd.Series) -> None:
+    """Render the stacked raw-trace panels for a single selected event."""
+    df = load_samples(db_path, int(ev_row["event_id"]))
+    if df.empty:
+        st.info(
+            "No raw samples for this event. Raw capture only exists for sessions "
+            "logged after the feature was added — re-run the logger to populate it."
+        )
+        return
+
+    # Put t=0 at the moment braking/coasting actually began (first EVENT frame),
+    # so the pre-roll is negative time and the event itself is positive.
+    event_frames = df[df["phase"] == "EVENT"]
+    zero_ms = event_frames["t_ms"].min() if not event_frames.empty else df["t_ms"].min()
+    df = df.copy()
+    df["t_rel"] = (df["t_ms"] - zero_ms) / 1000.0
+    span = (0.0, df.loc[df["phase"] == "EVENT", "t_rel"].max() if not event_frames.empty else 0.0)
+
+    st.caption(
+        f"{len(df)} frames · shaded = event window · dashed line = event start. "
+        f"Pre-roll {abs(df['t_rel'].min()):.1f}s, post-roll {df['t_rel'].max() - span[1]:.1f}s."
+    )
+
+    # Panel 1: driver inputs (brake/throttle/steer overlaid → shows trail-braking)
+    st.altair_chart(
+        _trace_panel(df, {"brake": "Brake", "throttle": "Throttle", "steer": "Steer"},
+                     "Input (0–1) / steer (−1..1)", "Driver inputs", span),
+        use_container_width=True,
+    )
+    # Panel 2: wheel slip (lockups spike well above 1.0)
+    st.altair_chart(
+        _trace_panel(df, {"slip_fl": "FL", "slip_fr": "FR", "slip_rl": "RL", "slip_rr": "RR"},
+                     "Wheel slip ratio", "Wheel slip (lockup > 1.2)", span),
+        use_container_width=True,
+    )
+    # Panel 3: speed
+    st.altair_chart(
+        _trace_panel(df, {"speed_kmh": "Speed"}, "km/h", "Speed", span),
+        use_container_width=True,
+    )
+    # Panel 4: temperatures, with a toggle between tyre surface and brake disc
+    temp_kind = st.radio("Temperature channel", ["Tyre surface", "Brake disc"],
+                         horizontal=True, key=f"temp_{ev_row['event_id']}")
+    if temp_kind == "Tyre surface":
+        cols = {"tyre_fl": "FL", "tyre_fr": "FR", "tyre_rl": "RL", "tyre_rr": "RR"}
+        ytitle = "Tyre surface °C"
+    else:
+        cols = {"btemp_fl": "FL", "btemp_fr": "FR", "btemp_rl": "RL", "btemp_rr": "RR"}
+        ytitle = "Brake disc °C"
+    st.altair_chart(_trace_panel(df, cols, ytitle, f"{temp_kind} temperature", span),
+                    use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +262,27 @@ def main() -> None:
                 "peak_value": "Coast gap (ms)", "duration": "Duration (s)",
             })
             st.dataframe(fs, use_container_width=True, hide_index=True)
+
+        # -- Event detail: raw telemetry trace --------------------------
+        st.divider()
+        st.markdown("### 🔬 Event detail — raw trace")
+        if s_events.empty:
+            st.info("No events to inspect yet.")
+        else:
+            ev_all = s_events.merge(s_laps[["lap_id", "lap_number"]], on="lap_id", how="left")
+            # Newest-first so the most recent driving is easiest to reach.
+            ev_all = ev_all.sort_values("event_id", ascending=False)
+            ev_all["label"] = (
+                "Lap " + ev_all["lap_number"].fillna(0).astype(int).astype(str)
+                + " · " + ev_all["event_type"]
+                + " · " + ev_all["location"].astype(str)
+                + "  (#" + ev_all["event_id"].astype(str) + ")"
+            )
+            picked = st.selectbox(
+                "Pick an event to see its raw telemetry", ev_all["event_id"],
+                format_func=lambda eid: ev_all.loc[ev_all.event_id == eid, "label"].iloc[0],
+            )
+            render_event_detail(db_path, ev_all[ev_all.event_id == picked].iloc[0])
 
     # ------------------------------------------------------------------ B
     with strategic:

@@ -47,6 +47,7 @@ class TelemetryFrame:
     # Driver inputs / engine
     gas: float = 0.0
     brake: float = 0.0
+    steer_angle: float = 0.0   # normalized: 0 = centred, +/- = right/left
     gear: int = 0
     rpm: int = 0
     speed_kmh: float = 0.0
@@ -224,6 +225,7 @@ class SharedMemoryReader:
             status=gfx.status,
             gas=phys.gas,
             brake=phys.brake,
+            steer_angle=phys.steerAngle,
             gear=phys.gear,
             rpm=phys.rpms,
             speed_kmh=phys.speedKmh,
@@ -423,6 +425,7 @@ class Simulator:
         corner_hit, intensity = self._nearest_corner(pos)
         brake = 0.0
         gas = 0.95 + self.rng.uniform(-0.05, 0.05)
+        steer = 0.0 + self.rng.uniform(-0.02, 0.02)         # ~straight on the straight
         gear = 5
         speed = 235.0 + self.rng.uniform(-10, 10)
         slip = [0.05] * 4                                   # FL, FR, RL, RR
@@ -438,6 +441,11 @@ class Simulator:
             gas = max(0.0, 0.15 - intensity * 0.15)
             gear = c["gear"]
             speed = max(70.0, 235.0 - intensity * 150.0)   # scrub off speed
+            # Steering winds on through the corner. Alternate L/R by corner so a
+            # stint shows both lock directions. Because steer rises while brake
+            # is still applied, the data exhibits realistic trail-braking.
+            direction = 1.0 if idx % 2 == 0 else -1.0
+            steer = direction * intensity * (0.6 + self.rng.uniform(-0.05, 0.05))
             # Brakes and tyres heat up in proportion to how hard we're braking;
             # "heavy" corners dump more energy into the discs.
             heat = intensity * (260.0 if c["heavy"] else 150.0)
@@ -467,6 +475,7 @@ class Simulator:
             status=AC_LIVE,
             gas=round(max(0.0, min(1.0, gas)), 3),
             brake=round(max(0.0, min(1.0, brake)), 3),
+            steer_angle=round(max(-1.0, min(1.0, steer)), 3),
             gear=gear,
             rpm=rpm,
             speed_kmh=round(speed, 1),
