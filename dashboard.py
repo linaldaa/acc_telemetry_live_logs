@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+import time
 
 import altair as alt          # bundled with Streamlit; no extra dependency
 import pandas as pd
@@ -177,21 +178,16 @@ def render_event_detail(db_path: str, ev_row: pd.Series) -> None:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-def main() -> None:
-    st.set_page_config(page_title="ACC Virtual Race Engineer", layout="wide")
-    db_path = get_db_path()
-
-    st.title("🏁 ACC Telemetry — Virtual Race Engineer")
-
+def render_dashboard(db_path: str) -> None:
     try:
         sessions, laps, events = load(db_path)
     except Exception as exc:
         st.error(f"Could not read database '{db_path}': {exc}")
-        st.stop()
+        return
 
     if sessions.empty:
         st.warning("No sessions found yet. Run `python logger.py --sim` to generate data.")
-        st.stop()
+        return
 
     # Session picker
     sessions["label"] = (
@@ -278,10 +274,19 @@ def main() -> None:
                 + " · " + ev_all["location"].astype(str)
                 + "  (#" + ev_all["event_id"].astype(str) + ")"
             )
-            picked = st.selectbox(
-                "Pick an event to see its raw telemetry", ev_all["event_id"],
-                format_func=lambda eid: ev_all.loc[ev_all.event_id == eid, "label"].iloc[0],
+            follow = st.checkbox(
+                "Follow latest event", value=True, key="follow_latest",
+                help="Automatically show the most recent event as you drive.",
             )
+            if follow:
+                picked = int(ev_all["event_id"].max())
+                lbl = ev_all.loc[ev_all.event_id == picked, "label"].iloc[0]
+                st.caption(f"Following latest → {lbl}")
+            else:
+                picked = st.selectbox(
+                    "Pick an event to see its raw telemetry", ev_all["event_id"],
+                    format_func=lambda eid: ev_all.loc[ev_all.event_id == eid, "label"].iloc[0],
+                )
             render_event_detail(db_path, ev_all[ev_all.event_id == picked].iloc[0])
 
     # ------------------------------------------------------------------ B
@@ -330,6 +335,29 @@ def main() -> None:
                 "fuel_used": "Fuel used (L)", "fuel_end": "Fuel remaining (L)",
             })
             st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title="ACC Virtual Race Engineer", layout="wide")
+    db_path = get_db_path()
+    st.title("🏁 ACC Telemetry — Virtual Race Engineer")
+
+    # Live auto-refresh: re-run the whole page on a timer so it tracks the
+    # session as the logger writes new laps/events. Widget selections persist
+    # across reruns, so your session pick and toggles stay put.
+    auto = st.sidebar.checkbox(
+        "🔴 Live auto-refresh", value=True,
+        help="Re-read the database on a timer so the page updates as you drive.",
+    )
+    interval = st.sidebar.slider("Refresh every (seconds)", 1, 30, 3) if auto else 0
+
+    render_dashboard(db_path)
+
+    if auto:
+        # Sleep, drop cached data so the next run reads fresh rows, then rerun.
+        time.sleep(interval)
+        st.cache_data.clear()
+        st.rerun()
 
 
 if __name__ == "__main__":
